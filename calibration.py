@@ -9,7 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 from time import perf_counter
 from typing import List, Tuple, Set, Optional
-from scipy.ndimage import median_filter  # 파일 상단에 추가
+
 import numpy as np
 import pyqtgraph as pg  # type: ignore[import]
 import pywt  # type: ignore[import]
@@ -19,7 +19,7 @@ from scipy import signal  # type: ignore[import]
 from scipy.interpolate import interp1d, PchipInterpolator  # type: ignore[import]
 from scipy.linalg import solveh_banded  # type: ignore[import]
 from scipy.ndimage import (  # type: ignore[import]
-    binary_dilation, uniform_filter1d, percentile_filter
+    binary_dilation, uniform_filter1d, percentile_filter, median_filter
 )
 from scipy.signal import (  # type: ignore[import]
     butter, filtfilt, decimate, savgol_filter
@@ -54,19 +54,7 @@ DEFAULTS = dict(
 # Lightweight Profiler
 # =========================
 _PROF = defaultdict(lambda: {"calls": 0, "total": 0.0})
-def bilateral_filter_1d(signal, sigma_s=5, sigma_r=0.2):
-    n = len(signal)
-    out = np.zeros_like(signal)
-    for i in range(n):
-        start = max(i - 3*sigma_s, 0)
-        end = min(i + 3*sigma_s, n)
-        idx = np.arange(start, end)
-        spatial = np.exp(-0.5 * ((idx - i) / sigma_s) ** 2)
-        range_ = np.exp(-0.5 * ((signal[idx] - signal[i]) / sigma_r) ** 2)
-        weights = spatial * range_
-        weights /= np.sum(weights)
-        out[i] = np.sum(signal[idx] * weights)
-    return out
+
 
 def _prof_add(name: str, dt: float):
     d = _PROF[name]
@@ -162,100 +150,6 @@ FS_RAW = 250.0
 FS = 250.0
 DECIM = max(1, int(round(FS_RAW / FS)))
 
-from scipy.ndimage import uniform_filter1d
-
-def _guided_filter_1d(p: np.ndarray, radius: int, eps: float) -> np.ndarray:
-    """
-    Self-guided filter in 1D (edge-preserving smoothing).
-    p: 입력 신호, radius: 윈도 반경(샘플), eps: 정규화 항(분산 대비)
-    """
-    p = np.asarray(p, float)
-    win = max(1, 2 * int(radius) + 1)
-    mean_p  = uniform_filter1d(p,    size=win, mode='nearest')
-    mean_pp = uniform_filter1d(p*p,  size=win, mode='nearest')
-    var_p   = np.maximum(mean_pp - mean_p*mean_p, 0.0)
-
-    a = var_p / (var_p + float(eps))          # self-guided → cov = var
-    b = mean_p - a * mean_p
-
-    mean_a = uniform_filter1d(a, size=win, mode='nearest')
-    mean_b = uniform_filter1d(b, size=win, mode='nearest')
-    return mean_a * p + mean_b
-
-def ecg_edge_preserve_qrsaware(
-    y: np.ndarray,
-    fs: float = 250.0,
-    win_ms: int = 28,          # guided filter 기본 윈도 (≈30ms)
-    strong_eps_scale: float = 0.08,  # 강평활(평지)용 eps 스케일(전역 std 기준)
-    weak_eps_scale: float = 0.35,    # 약평활(모서리)용 eps 스케일
-    slope_q: float = 0.90,     # 급경사 판별 분위수(상위 10%를 모서리로 보호)
-    qrs_blend_ms: int = 80,    # QRS 보호 블렌딩 폭
-    edge_softness: float = 6.0 # 모서리 소프트 마스크 셰이프(클수록 급히 전환)
-) -> np.ndarray:
-    """
-    - Guided filter를 두 강도로 계산(강/약).
-    - 기울기(모서리) 기반 소프트 마스크로 강/약 결과를 per-sample 블렌딩.
-    - QRS/T 보호마스크로 최종 결과를 원신호와 다시 블렌딩.
-    """
-    x = np.asarray(y, float)
-    if x.size < 8: return x.copy()
-
-    # 0) 전역 통계 및 파라미터
-    g_std = float(np.std(x)) + 1e-9
-    r = max(1, int(round((win_ms / 1000.0) * fs / 2.0)) * 2 + 1) // 2  # 홀수 길이 보정
-    eps_strong = (strong_eps_scale * g_std)**2   # 평지에서 강하게 누름
-    eps_weak   = (weak_eps_scale   * g_std)**2   # 모서리에서 덜 누름
-
-    # 1) 두 강도의 guided filtering
-    y_strong = _guided_filter_1d(x, radius=r, eps=eps_strong)  # 더 흐림
-    y_weak   = _guided_filter_1d(x, radius=r, eps=eps_weak)    # 덜 흐림
-
-    # 2) 모서리(급경사) 소프트 마스크 (0=평지, 1=모서리)
-    g = np.gradient(x)
-    s = np.abs(g)
-    thr = float(np.quantile(s, slope_q))
-    # sigmoid형 소프트 마스크
-    edge_mask = 1.0 / (1.0 + np.exp(-edge_softness * (s - thr) / (thr + 1e-9)))
-
-    # 모서리에서는 약평활(y_weak), 평지에서는 강평활(y_strong)
-    y_edge = (1.0 - edge_mask) * y_strong + edge_mask * y_weak
-
-    # 3) QRS/T 보호 마스크 (기존 make_qrs_mask 재활용)
-    try:
-        m = make_qrs_mask(x, fs=int(fs))  # True=QRS 바깥
-    except Exception:
-        m = np.ones_like(x, dtype=bool)
-
-    # 부드럽게(시간 축) 페이드
-    L = max(3, int(round((qrs_blend_ms / 1000.0) * fs)))
-    L += (L % 2 == 0)
-    w = np.hanning(L); w /= w.sum()
-    alpha = np.convolve(m.astype(float), w, mode='same')  # 0~1
-
-    # 최종: QRS 주변(α↓)은 원신호 가중↑, 그 외(α↑)는 y_edge 가중↑
-    y_out = alpha * y_edge + (1.0 - alpha) * x
-    return y_out
-
-
-# ----- [NEW] Array-aware 캐시 도우미 -----
-import hashlib
-
-def _fingerprint(arr: np.ndarray) -> tuple:
-    if arr is None or arr.size == 0:
-        return (0, 0, 0.0, 0.0)
-    # 빠른 해시(길이, dtype, 일부 샘플 기반)
-    h = hashlib.blake2b(arr[:min(arr.size, 4096)].tobytes(), digest_size=8).hexdigest()
-    return (arr.size, hash(arr.dtype.str), float(arr[0]), float(arr[-1])), h
-
-class _ECGCaches:
-    def __init__(self):
-        self.last_sig_fp = None
-        self.r_idx = None
-        self.v_idx = None
-        self.qrs_mask = None
-
-CACHES = _ECGCaches()
-
 
 # =========================
 # IO & Utils (필요한 것만)
@@ -327,37 +221,20 @@ def highpass_zero_drift(x, fs, fc=0.3, order=2):
     b, a = butter(order, fc / (fs / 2.0), btype='high')
     y = filtfilt(b, a, np.asarray(x, float))
     return y - np.median(y)
-# =========================
-# Smooth but keep R (cached grids)
-# =========================
-_SP_CACHE = {}
+
 
 def smooth_preserve_r(ecg, fs=250, target_fs=100):
-    key = (len(ecg), fs, target_fs)
-    grids = _SP_CACHE.get(key)
-    if grids is None:
-        # 캐시할 시간 그리드
-        t = np.linspace(0, len(ecg) / fs, len(ecg))
-        decim = int(round(fs / target_fs))
-        n_ds = int(np.ceil(len(ecg) / decim))
-        t_d = np.linspace(0, len(ecg) / fs, n_ds)
-        _SP_CACHE[key] = (t, t_d, decim)
-        t, t_d, decim = _SP_CACHE[key]
-    else:
-        t, t_d, decim = grids
-
-    # 1) bandpass (저차, padlen 안정화)
+    # 1) bandpass
     b, a = butter(2, [0.5 / (fs / 2), 35 / (fs / 2)], btype='band')
-    padlen = min(3 * max(len(a), len(b)), max(0, ecg.size - 1))
-    ecg_f = filtfilt(b, a, ecg, padlen=padlen)
-
-    # 2) downsample (FIR decimate는 이미 빠름)
-    ecg_d = decimate(ecg_f, decim, ftype='fir', zero_phase=True)
-
-    # 3) upsample back (캐시된 그리드 사용)
-    interp = interp1d(t_d, ecg_d, kind='cubic', fill_value='extrapolate', assume_sorted=True)
+    ecg_f = filtfilt(b, a, ecg)
+    # 2) downsample
+    decim = int(round(fs / target_fs))
+    ecg_d = decimate(ecg_f, decim, ftype='fir')
+    # 3) upsample back
+    t_d = np.linspace(0, len(ecg) / fs, len(ecg_d))
+    t = np.linspace(0, len(ecg) / fs, len(ecg))
+    interp = interp1d(t_d, ecg_d, kind='cubic', fill_value='extrapolate')
     return interp(t)
-
 
 
 # =========================
@@ -1264,25 +1141,20 @@ def baseline_asls_masked(y, lam=1e6, p=0.008, niter=10, mask=None,
     w = np.ones(N, dtype=y.dtype)
     z = np.zeros(N, dtype=y.dtype)
     last_obj = None
-    for it in range(int(niter)):
-        wg = w * g  # 새 배열 대신 뷰 연산
+    for it in range(base_niter):
+        wg = (w * g).astype(y.dtype, copy=False)
         ab_u[2, :] = lam * 6.0 + wg
         b = wg * y
         z = solveh_banded(ab_u, b, lower=False, overwrite_ab=False,
                           overwrite_b=True, check_finite=False)
-        # 벡터화된 가중 업데이트
-        w = (y > z)
-        w = p * w + (1.0 - p) * (~w)
-
+        w = p * (y > z) + (1.0 - p) * (y < z)
         if it >= 1:
             r = (y - z)
-            # 순수 벡터 내적 (캐스팅 최소화)
-            data_term = float((wg * r).dot(r))
-            d2 = np.diff(z, n=2, prepend=float(z[0]), append=float(z[-1]))
-            reg_term = float(lam) * float(d2.dot(d2))
+            data_term = float(np.dot((wg * r).astype(np.float64), r.astype(np.float64)))
+            d2 = np.diff(z.astype(np.float64), n=2, prepend=float(z[0]), append=float(z[-1]))
+            reg_term = float(lam) * float(np.dot(d2, d2))
             obj = data_term + reg_term
-            if last_obj is not None and abs(last_obj - obj) <= 1e-5 * max(1.0, obj):
-                break
+            if last_obj is not None and abs(last_obj - obj) <= 1e-5 * max(1.0, obj): break
             last_obj = obj
     return z.astype(np.float64, copy=False)
 
@@ -2062,10 +1934,10 @@ class ECGViewer(QtWidgets.QWidget):
         # === No AGC / No Glitch ===
         y_corr_eq = y_corr
 
-        # # 추가 평활(저주파 보존, R-peak 보존 경향)
-        # y_corr_eq = smooth_preserve_r(y_corr_eq, target_fs=50)
-        #
-        # # 1초 메디안 베이스라인 제거로 잔류 오프셋 정리
+        # 추가 평활(저주파 보존, R-peak 보존 경향)
+        y_corr_eq = smooth_preserve_r(y_corr_eq, target_fs=50)
+
+        # 1초 메디안 베이스라인 제거로 잔류 오프셋 정리
         baseline = signal.medfilt(y_corr_eq, kernel_size=251)
         y_corr_eq = y_corr_eq - baseline
 
@@ -2100,8 +1972,15 @@ class ECGViewer(QtWidgets.QWidget):
                                      wins=roi_wins, fs=FS,
                                      gamma=0.5, corr_min=0.15)
 
-        y_corr_eq = smooth_preserve_r(y_corr_eq, target_fs=100)
+        # # Q/ST 국소 affine 복구 (원신호 기준)
+        # y_corr_eq = affine_restore_roi(
+        #     y_before_qvri, y_corr_qvri, wins_protect,
+        #     gmin=0.95, gmax=1.12, off_cap=0.25,
+        #     blend_ms=60, fs=FS, corr_min=0.15, skip_if_negative=False
+        # )
+        #
 
+        # y_corr_eq = y_corr_qvri
 
         # 오버레이 표시
         if self.show_rpeaks and r_after.size > 0:

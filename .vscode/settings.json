@@ -1,0 +1,23 @@
+{
+    "cSpell.words": [
+        "pyqtgraph"
+    ],
+    "swark.languageModel": "gpt-4o",
+    "swark.fileExtensions": [
+        "py"
+    ],
+    "swark.excludePatterns": [
+        "**/node_modules/**",
+        "**/.git/**",
+        "**/__pycache__/**",
+        "**/.venv/**",
+        "**/dist/**",
+        "**/build/**",
+        "**/data/**",
+        "**/dataset/**",
+        "**/results/**",
+        "**/*.npy",
+        "**/*.npz",
+        "**/*.pth"
+    ]
+}
